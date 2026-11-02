@@ -1,0 +1,9 @@
+# Local toolchain and build/run artifacts; only the build scripts, README and
+# this file are tracked.
+/toolchain/
+/build/
+/bin/
+/logs/
+/dl/
+/patches/
+/scripts/
