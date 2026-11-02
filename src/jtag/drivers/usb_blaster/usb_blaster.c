@@ -87,6 +87,9 @@
  */
 #define BUF_LEN 4096
 
+/* Maximum number of raw TDO bytes accumulated between two USB reads */
+#define TDO_BATCH_MAX 128
+
 /* USB-Blaster II specific command */
 #define CMD_COPY_TDO_BUFFER	0x5F
 
@@ -95,6 +98,14 @@ enum gpio_steer {
 	FIXED_1,
 	SRST,
 	TRST,
+};
+
+struct ublast_pending {
+	struct scan_command *cmd;
+	uint8_t *buf;
+	int nb8;
+	int nb1;
+	struct ublast_pending *next;
 };
 
 struct ublast_info {
@@ -106,6 +117,12 @@ struct ublast_info {
 	bool srst_asserted;
 	uint8_t buf[BUF_LEN];
 	int bufidx;
+
+	int batch;
+	struct ublast_pending *pending;
+	struct ublast_pending *pending_tail;
+	int pending_count;
+	int pending_bytes;
 
 	char *lowlevel_name;
 	struct ublast_lowlevel *drv;
@@ -126,6 +143,7 @@ static struct ublast_info info = {
 	.trst_asserted = false,
 	.pin6 = FIXED_1,
 	.pin8 = FIXED_1,
+	.batch = 1,
 };
 
 /*
@@ -511,6 +529,31 @@ static void ublast_state_move(enum tap_state state, int skip)
 }
 
 /**
+ * ublast_read_tdos - read raw TDO bytes from the USB Blaster
+ * @param buf the buffer to store the bytes
+ * @param nb_bytes the number of bytes
+ *
+ * Flushes all queued writes and reads exactly nb_bytes TDO bytes from the
+ * USB Blaster. Short reads are handled by continuing with the rest of the
+ * buffer.
+ *
+ * Returns ERROR_OK if OK, ERROR_xxx if a read error occurred
+ */
+static int ublast_read_tdos(uint8_t *buf, int nb_bytes)
+{
+	uint32_t retlen;
+	int ret = ERROR_OK;
+
+	ublast_flush_buffer();
+	while (ret == ERROR_OK && nb_bytes > 0) {
+		ret = ublast_buf_read(buf, nb_bytes, &retlen);
+		buf += retlen;
+		nb_bytes -= retlen;
+	}
+	return ret;
+}
+
+/**
  * ublast_read_byteshifted_tdos - read TDO of byteshift writes
  * @param buf the buffer to store the bits
  * @param nb_bytes the number of bytes
@@ -526,16 +569,8 @@ static void ublast_state_move(enum tap_state state, int skip)
  */
 static int ublast_read_byteshifted_tdos(uint8_t *buf, int nb_bytes)
 {
-	uint32_t retlen;
-	int ret = ERROR_OK;
-
 	LOG_DEBUG_IO("%s(buf=%p, num_bits=%d)", __func__, buf, nb_bytes * 8);
-	ublast_flush_buffer();
-	while (ret == ERROR_OK && nb_bytes > 0) {
-		ret = ublast_buf_read(buf, nb_bytes, &retlen);
-		nb_bytes -= retlen;
-	}
-	return ret;
+	return ublast_read_tdos(buf, nb_bytes);
 }
 
 /**
@@ -578,6 +613,95 @@ static int ublast_read_bitbang_tdos(uint8_t *buf, int nb_bits)
 	return ret;
 }
 
+static void ublast_pending_add(struct scan_command *cmd, uint8_t *buf,
+			       int nb8, int nb1)
+{
+	struct ublast_pending *p = calloc(1, sizeof(*p));
+
+	if (!p) {
+		LOG_ERROR("out of memory");
+		free(buf);
+		return;
+	}
+
+	p->cmd = cmd;
+	p->buf = buf;
+	p->nb8 = nb8;
+	p->nb1 = nb1;
+
+	if (info.pending_tail)
+		info.pending_tail->next = p;
+	else
+		info.pending = p;
+	info.pending_tail = p;
+	info.pending_count++;
+	info.pending_bytes += nb8 + nb1;
+}
+
+static void ublast_pending_discard(void)
+{
+	struct ublast_pending *p = info.pending;
+
+	while (p) {
+		struct ublast_pending *next = p->next;
+
+		free(p->buf);
+		free(p);
+		p = next;
+	}
+
+	info.pending = NULL;
+	info.pending_tail = NULL;
+	info.pending_count = 0;
+	info.pending_bytes = 0;
+}
+
+static int ublast_pending_flush(void)
+{
+	struct ublast_pending *p, *next;
+	uint8_t *raw;
+	int ret;
+	int off = 0;
+
+	if (!info.pending)
+		return ERROR_OK;
+
+	raw = malloc(info.pending_bytes);
+	if (!raw) {
+		ublast_pending_discard();
+		return ERROR_FAIL;
+	}
+
+	ret = ublast_read_tdos(raw, info.pending_bytes);
+	for (p = info.pending; p; p = next) {
+		next = p->next;
+		if (ret == ERROR_OK) {
+			memcpy(p->buf, &raw[off], p->nb8);
+			if (p->nb1) {
+				uint8_t tail = 0;
+
+				for (int i = 0; i < p->nb1; i++) {
+					if (raw[off + p->nb8 + i] & READ_TDO)
+						tail |= 1 << i;
+				}
+				p->buf[p->nb8] = tail;
+			}
+			ret = jtag_read_buffer(p->buf, p->cmd);
+		}
+
+		off += p->nb8 + p->nb1;
+		free(p->buf);
+		free(p);
+	}
+
+	free(raw);
+	info.pending = NULL;
+	info.pending_tail = NULL;
+	info.pending_count = 0;
+	info.pending_bytes = 0;
+	return ret;
+}
+
 /**
  * ublast_queue_tdi - short description
  * @param bits bits to be queued on TDI (or NULL if 0 are to be queued)
@@ -597,12 +721,16 @@ static int ublast_read_bitbang_tdos(uint8_t *buf, int nb_bits)
  * If TCK was high, the USB blaster will queue TDI on falling edge, and read TDO
  * on rising edge !!!
  */
-static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
+static bool ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan,
+			     struct scan_command *cmd)
 {
 	int nb8 = nb_bits / 8;
 	int nb1 = nb_bits % 8;
 	int nbfree_in_packet, i, trans = 0, read_tdos;
-	uint8_t *tdos = calloc(1, nb_bits / 8 + 1);
+	int last_off = 0, last_trans = 0;
+	bool defer;
+	uint8_t raw[MAX_PACKET_SIZE + 8] = { 0 };
+	uint8_t *tdos;
 	static uint8_t byte0[BUF_LEN];
 
 	/*
@@ -620,6 +748,10 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 	}
 
 	read_tdos = (scan == SCAN_IN || scan == SCAN_IO);
+	defer = read_tdos && bits && cmd && info.batch > 1 && nb_bits > 0 &&
+		 nb8 + nb1 <= TDO_BATCH_MAX;
+	tdos = defer ? NULL : calloc(1, nb_bits / 8 + 1);
+
 	for (i = 0; i < nb8; i += trans) {
 		/*
 		 * Calculate number of bytes to fill USB packet of size MAX_PACKET_SIZE
@@ -644,7 +776,19 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 		if (read_tdos) {
 			if (info.flags & COPY_TDO_BUFFER)
 				ublast_queue_byte(CMD_COPY_TDO_BUFFER);
-			ublast_read_byteshifted_tdos(&tdos[i], trans);
+			if (!defer) {
+				/*
+				 * The last byteshift block is read together with the
+				 * bitbang tail below, so that a scan only needs one
+				 * USB read instead of two.
+				 */
+				if (i + trans == nb8) {
+					last_off = i;
+					last_trans = trans;
+				} else {
+					ublast_read_byteshifted_tdos(&tdos[i], trans);
+				}
+			}
 		}
 	}
 
@@ -658,10 +802,25 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 		else
 			ublast_clock_tdi(tdi, scan);
 	}
-	if (nb1 && read_tdos) {
-		if (info.flags & COPY_TDO_BUFFER)
-			ublast_queue_byte(CMD_COPY_TDO_BUFFER);
-		ublast_read_bitbang_tdos(&tdos[nb8], nb1);
+	if (read_tdos && nb1 && (info.flags & COPY_TDO_BUFFER))
+		ublast_queue_byte(CMD_COPY_TDO_BUFFER);
+	if (!defer && read_tdos && (last_trans || nb1)) {
+		if (last_trans) {
+			ublast_read_tdos(raw, last_trans + nb1);
+			memcpy(&tdos[last_off], raw, last_trans);
+			for (i = 0; i < nb1; i++) {
+				if (raw[last_trans + i] & READ_TDO)
+					tdos[nb8] |= 1 << i;
+			}
+		} else {
+			ublast_read_bitbang_tdos(&tdos[nb8], nb1);
+		}
+	}
+
+	if (defer) {
+		ublast_pending_add(cmd, bits, nb8, nb1);
+		ublast_idle_clock();
+		return true;
 	}
 
 	if (bits)
@@ -672,6 +831,7 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 	 * Ensure clock is in lower state
 	 */
 	ublast_idle_clock();
+	return false;
 }
 
 static void ublast_runtest(unsigned int num_cycles, enum tap_state state)
@@ -679,14 +839,14 @@ static void ublast_runtest(unsigned int num_cycles, enum tap_state state)
 	LOG_DEBUG_IO("%s(cycles=%u, end_state=%d)", __func__, num_cycles, state);
 
 	ublast_state_move(TAP_IDLE, 0);
-	ublast_queue_tdi(NULL, num_cycles, SCAN_OUT);
+	ublast_queue_tdi(NULL, num_cycles, SCAN_OUT, NULL);
 	ublast_state_move(state, 0);
 }
 
 static void ublast_stableclocks(unsigned int num_cycles)
 {
 	LOG_DEBUG_IO("%s(cycles=%u)", __func__, num_cycles);
-	ublast_queue_tdi(NULL, num_cycles, SCAN_OUT);
+	ublast_queue_tdi(NULL, num_cycles, SCAN_OUT, NULL);
 }
 
 /**
@@ -703,11 +863,14 @@ static int ublast_scan(struct scan_command *cmd)
 	uint8_t *buf = NULL;
 	enum scan_type type;
 	int ret = ERROR_OK;
+	int tdo_bytes;
+	bool deferred;
 	static const char * const type2str[] = { "", "SCAN_IN", "SCAN_OUT", "SCAN_IO" };
 	char *log_buf = NULL;
 
 	type = jtag_scan_type(cmd);
 	scan_bits = jtag_build_buffer(cmd, &buf);
+	tdo_bytes = (type == SCAN_IN || type == SCAN_IO) ? scan_bits : 0;
 
 	if (cmd->ir_scan)
 		ublast_state_move(TAP_IRSHIFT, 0);
@@ -721,10 +884,24 @@ static int ublast_scan(struct scan_command *cmd)
 		  scan_bits, log_buf, cmd->end_state);
 	free(log_buf);
 
-	ublast_queue_tdi(buf, scan_bits, type);
+	if (info.batch > 1 && tdo_bytes &&
+	    info.pending_bytes + tdo_bytes > TDO_BATCH_MAX) {
+		ret = ublast_pending_flush();
+		if (ret != ERROR_OK) {
+			free(buf);
+			return ret;
+		}
+	}
 
-	ret = jtag_read_buffer(buf, cmd);
-	free(buf);
+	deferred = ublast_queue_tdi(buf, scan_bits, type, cmd);
+	if (deferred) {
+		if (info.pending_count >= info.batch ||
+		    info.pending_bytes >= TDO_BATCH_MAX)
+			ret = ublast_pending_flush();
+	} else {
+		ret = jtag_read_buffer(buf, cmd);
+		free(buf);
+	}
 	/*
 	 * ublast_queue_tdi sends the last bit with TMS=1. We are therefore
 	 * already in Exit1-DR/IR and have to skip the first step on our way
@@ -788,7 +965,9 @@ static int ublast_execute_queue(struct jtag_command *cmd_queue)
 	     cmd = cmd->next) {
 		switch (cmd->type) {
 		case JTAG_RESET:
-			ublast_reset(cmd->cmd.reset->trst, cmd->cmd.reset->srst);
+			ret = ublast_pending_flush();
+			if (ret == ERROR_OK)
+				ublast_reset(cmd->cmd.reset->trst, cmd->cmd.reset->srst);
 			break;
 		case JTAG_RUNTEST:
 			ublast_runtest(cmd->cmd.runtest->num_cycles,
@@ -807,7 +986,9 @@ static int ublast_execute_queue(struct jtag_command *cmd_queue)
 			ublast_tms(cmd->cmd.tms);
 			break;
 		case JTAG_SLEEP:
-			ublast_usleep(cmd->cmd.sleep->us);
+			ret = ublast_pending_flush();
+			if (ret == ERROR_OK)
+				ublast_usleep(cmd->cmd.sleep->us);
 			break;
 		case JTAG_SCAN:
 			ret = ublast_scan(cmd->cmd.scan);
@@ -820,6 +1001,10 @@ static int ublast_execute_queue(struct jtag_command *cmd_queue)
 		}
 	}
 
+	if (ret == ERROR_OK)
+		ret = ublast_pending_flush();
+	else
+		ublast_pending_discard();
 	ublast_flush_buffer();
 	return ret;
 }
@@ -917,6 +1102,7 @@ static int ublast_quit(void)
 	uint8_t byte0 = 0;
 	uint32_t retlen;
 
+	ublast_pending_discard();
 	ublast_buf_write(&byte0, 1, &retlen);
 	return info.drv->close(info.drv);
 }
@@ -1007,6 +1193,27 @@ COMMAND_HANDLER(ublast_firmware_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(ublast_handle_batch_command)
+{
+	unsigned int batch;
+
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (CMD_ARGC == 0) {
+		command_print(CMD, "usb_blaster: batch=%d", info.batch);
+		return ERROR_OK;
+	}
+
+	COMMAND_PARSE_NUMBER(uint, CMD_ARGV[0], batch);
+	if (batch < 1 || batch > 64) {
+		LOG_ERROR("%s: batch must be between 1 and 64", CMD_NAME);
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	info.batch = batch;
+	return ERROR_OK;
+}
 
 static const struct command_registration ublast_subcommand_handlers[] = {
 	{
@@ -1015,6 +1222,13 @@ static const struct command_registration ublast_subcommand_handlers[] = {
 		.mode = COMMAND_CONFIG,
 		.help = "set the lowlevel access for the USB Blaster (ftdi, ublast2)",
 		.usage = "(ftdi|ublast2)",
+	},
+	{
+		.name = "batch",
+		.handler = ublast_handle_batch_command,
+		.mode = COMMAND_ANY,
+		.help = "set number of scans accumulated between USB reads",
+		.usage = "[count]",
 	},
 	{
 		.name = "pin",

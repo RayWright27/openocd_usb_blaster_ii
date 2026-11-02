@@ -42,3 +42,20 @@ For more information, see:
 
 - <https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/usb-device-specific-registry-settings>
 - <https://www.ftdichip.com/Support/Knowledgebase/index.html?ignorehardwareserialnumber.htm>
+
+## Using a locally built OpenOCD with xPack scripts
+
+A locally built OpenOCD may not have the xPack script directory compiled in.
+When replacing the xPack `openocd.exe`, pass the scripts directory explicitly:
+
+```sh
+openocd -s C:/xpack-openocd/openocd/scripts ...
+```
+
+Alternatively, set the `OPENOCD_SCRIPTS` environment variable. Keep
+`libusb-1.0.dll` and `libftdi1.dll` next to the executable as well.
+
+For USB-Blaster II, the `usb_blaster batch <n>` command can reduce the number of
+USB round trips when reading TDO. The default is `1`; start with `8` and verify
+the target after changing it. Values above `8` may exceed the adapter FIFO for
+TDO-heavy operations. See the OpenOCD manual for details.

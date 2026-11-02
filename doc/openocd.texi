@@ -3079,6 +3079,15 @@ This command specifies @var{path} to access USB-Blaster II firmware
 image. To be used with USB-Blaster II only.
 @end deffn
 
+@deffn {Command} {usb_blaster batch} [@var{count}]
+Sets the number of scans whose TDO data is accumulated before one USB
+read. The default is 1, which reads TDO after every scan. Larger values
+reduce the number of USB transfers at the cost of using more adapter
+FIFO space. Accumulated TDO data is limited to 128 bytes; larger batches
+are split automatically. Without an argument, the current value is
+printed.
+@end deffn
+
 @end deffn
 
 @deffn {Interface Driver} {gw16012}
